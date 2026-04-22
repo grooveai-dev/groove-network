@@ -1083,6 +1083,12 @@ class InferenceClient:
         self._ttft_ms = (time.perf_counter() - self._generation_start) * 1000.0
         self._first_token_emitted = True
 
+        if next_token in stop_ids:
+            timing = self._finalize_timing()
+            logger.info("generation timing: %s", json.dumps(timing))
+            self.emit_event({"type": "timing", **timing})
+            return
+
         decode_start = time.perf_counter()
         text = self.tokenizer.decode([next_token], skip_special_tokens=True)
         decode_ms = (time.perf_counter() - decode_start) * 1000.0
@@ -1145,6 +1151,9 @@ class InferenceClient:
                     sample_ms = (time.perf_counter() - sample_start) * 1000.0
 
                 generated.append(next_token)
+
+                if next_token in stop_ids:
+                    break
 
                 decode_start = time.perf_counter()
                 text = self.tokenizer.decode([next_token], skip_special_tokens=True)
@@ -1273,6 +1282,9 @@ class InferenceClient:
                     sample_ms = (time.perf_counter() - sample_start) * 1000.0
 
                 generated.append(next_token)
+
+                if next_token in stop_ids:
+                    break
 
                 decode_start = time.perf_counter()
                 text = self.tokenizer.decode([next_token], skip_special_tokens=True)
