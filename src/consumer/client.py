@@ -463,6 +463,60 @@ class InferenceClient:
 
         self.p2p_connected.add(node_id)
         logger.info("P2P channel ready with %s", node_id[:12])
+        asyncio.create_task(self._p2p_receive_loop(node_id))
+
+    async def _p2p_receive_loop(self, node_id: str) -> None:
+        """Read P2P responses from a node and resolve waiters."""
+        pm = self.peer_manager
+        channel = self.p2p_channels.get(node_id)
+        if pm is None or channel is None:
+            return
+        try:
+            while node_id in self.p2p_connected:
+                try:
+                    raw = await asyncio.wait_for(pm.recv(node_id), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if not pm.is_connected(node_id):
+                        break
+                    continue
+
+                complete = channel.on_chunk_received(raw)
+                if complete is None:
+                    continue
+
+                try:
+                    inner = msgpack.unpackb(
+                        complete, raw=False,
+                        max_str_len=10 * 1024 * 1024,
+                        max_bin_len=10 * 1024 * 1024,
+                        max_array_len=10_000,
+                        max_map_len=1_000,
+                    )
+                except Exception:
+                    logger.warning("P2P payload decode failed from %s", node_id[:12])
+                    continue
+
+                if inner.get("type") == ERROR:
+                    seq = inner.get("seq_pos")
+                    err = RuntimeError(
+                        f"Node error [{inner.get('code')}]: "
+                        f"{inner.get('message', '')}"
+                    )
+                    if seq is not None:
+                        fut = self._waiters.pop(seq, None)
+                        if fut is not None and not fut.done():
+                            fut.set_exception(err)
+                    continue
+
+                seq = inner.get("seq_pos")
+                if seq is not None:
+                    fut = self._waiters.pop(seq, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(inner)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("P2P receive loop crashed for %s", node_id[:12])
 
     async def _send_to_node(
         self, node_id: str, inner: dict, timeout: float | None = None,

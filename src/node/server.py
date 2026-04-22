@@ -58,6 +58,7 @@ from src.common.protocol import (
     make_error,
     make_heartbeat,
     make_logits,
+    make_p2p_ready,
     make_register_node,
     make_sdp_answer,
     make_verify_result,
@@ -934,6 +935,8 @@ class ComputeNodeServer:
 
         logger.info("SDP answer sent to %s", from_id[:12])
 
+        asyncio.create_task(self._activate_p2p(ws, from_id, msg.get("session_id", "")))
+
     async def _handle_sdp_answer(self, msg: dict) -> None:
         """Apply remote SDP answer to complete handshake."""
         pm = self._get_peer_manager()
@@ -994,6 +997,119 @@ class ComputeNodeServer:
                     break
         except asyncio.CancelledError:
             return
+
+    async def _activate_p2p(self, ws, peer_id: str, session_id: str) -> None:
+        """Wait for data channels to open, send P2P_READY, start receive loop."""
+        pm = self.peer_manager
+        if pm is None:
+            return
+        for _ in range(200):
+            if pm.is_connected(peer_id):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            logger.warning("P2P activation timeout for %s", peer_id[:12])
+            return
+
+        async def _p2p_send(data: bytes):
+            await pm.send(peer_id, data)
+
+        self.p2p_channels[peer_id] = ChunkedChannel(_p2p_send)
+
+        asyncio.create_task(self._p2p_receive_loop(ws, peer_id))
+
+        ready_msg = make_p2p_ready(
+            session_id=session_id,
+            node_id=self.node_id,
+            peer_node_id=peer_id,
+        )
+        try:
+            await ws.send(encode_message(ready_msg))
+        except (websockets.ConnectionClosed, OSError):
+            pass
+
+        logger.info("P2P activated with %s", peer_id[:12])
+        asyncio.create_task(self._monitor_peer_state(peer_id))
+
+    async def _p2p_receive_loop(self, ws, peer_id: str) -> None:
+        """Read incoming P2P data, dispatch, respond via P2P."""
+        pm = self.peer_manager
+        channel = self.p2p_channels.get(peer_id)
+        if pm is None or channel is None:
+            return
+        try:
+            while peer_id in self.p2p_channels:
+                try:
+                    raw = await asyncio.wait_for(pm.recv(peer_id), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if not pm.is_connected(peer_id):
+                        break
+                    continue
+
+                complete = channel.on_chunk_received(raw)
+                if complete is None:
+                    continue
+
+                try:
+                    inner = msgpack.unpackb(
+                        complete, raw=False,
+                        max_str_len=10 * 1024 * 1024,
+                        max_bin_len=10 * 1024 * 1024,
+                        max_array_len=10_000,
+                        max_map_len=1_000,
+                    )
+                except Exception:
+                    logger.exception("P2P payload decode failed from %s", peer_id[:12])
+                    continue
+
+                try:
+                    response = await self._dispatch(inner)
+                except torch.cuda.OutOfMemoryError:
+                    logger.error("CUDA OOM during P2P inference — clearing cache")
+                    torch.cuda.empty_cache()
+                    self.shard = None
+                    try:
+                        self.shard = await self._load_shard_async(
+                            self.model_name, self.layer_start, self.layer_end,
+                        )
+                    except Exception:
+                        logger.exception("shard reload failed after OOM")
+                    response = make_error(
+                        inner.get("session_id", ""), 503,
+                        "GPU out of memory — shard reloading",
+                    )
+                    response["seq_pos"] = inner.get("seq_pos")
+                except Exception as exc:
+                    logger.exception("P2P dispatch failed")
+                    response = make_error(
+                        inner.get("session_id", ""), 500,
+                        f"internal error: {type(exc).__name__}: {exc}",
+                    )
+                    response["seq_pos"] = inner.get("seq_pos")
+
+                if response is None:
+                    continue
+
+                response_bytes = msgpack.packb(response, use_bin_type=True)
+                try:
+                    await channel.send_message(response_bytes)
+                except Exception:
+                    logger.warning(
+                        "P2P response failed for %s, falling back to relay",
+                        peer_id[:12],
+                    )
+                    outbound = make_envelope(
+                        inner.get("stream_id", ""), response_bytes,
+                        target_node_id=None,
+                    )
+                    try:
+                        await ws.send(encode_message(outbound))
+                    except (websockets.ConnectionClosed, OSError):
+                        return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("P2P receive loop crashed for %s", peer_id[:12])
 
 
 def parse_layer_range(layer_str: str) -> tuple[int, int]:
