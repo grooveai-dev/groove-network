@@ -115,6 +115,8 @@ class InferenceClient:
         self._relay_send_count: int = 0
         self._reconnect_count: int = 0
         self._max_reconnect_per_peer: int = 3
+        self._token_traces: list[dict] = []
+        self._last_token_timing: dict = {}
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -538,16 +540,23 @@ class InferenceClient:
         fut: asyncio.Future = loop.create_future()
         self._waiters[seq] = fut
 
+        serialize_start = time.perf_counter()
         inner_bytes = msgpack.packb(inner, use_bin_type=True)
+        serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
+
         rtt_start = time.perf_counter()
+        via = "p2p"
 
         if node_id in self.p2p_connected and node_id in self.p2p_channels:
             try:
+                send_start = time.perf_counter()
                 await self.p2p_channels[node_id].send_message(inner_bytes)
+                send_ms = (time.perf_counter() - send_start) * 1000.0
                 self._p2p_send_count += 1
             except Exception:
                 logger.warning("P2P send to %s failed, falling back to relay", node_id[:12])
                 self.p2p_connected.discard(node_id)
+                via = "relay"
                 self.envelope_count += 1
                 env = make_envelope(
                     self.stream_id, inner_bytes,
@@ -555,12 +564,15 @@ class InferenceClient:
                     envelope_count=self.envelope_count,
                 )
                 try:
+                    send_start = time.perf_counter()
                     await self.relay_ws.send(encode_message(env))
+                    send_ms = (time.perf_counter() - send_start) * 1000.0
                     self._relay_send_count += 1
                 except Exception:
                     self._waiters.pop(seq, None)
                     raise
         else:
+            via = "relay"
             self.envelope_count += 1
             env = make_envelope(
                 self.stream_id, inner_bytes,
@@ -568,12 +580,15 @@ class InferenceClient:
                 envelope_count=self.envelope_count,
             )
             try:
+                send_start = time.perf_counter()
                 await self.relay_ws.send(encode_message(env))
+                send_ms = (time.perf_counter() - send_start) * 1000.0
                 self._relay_send_count += 1
             except Exception:
                 self._waiters.pop(seq, None)
                 raise
 
+        wait_start = time.perf_counter()
         try:
             result = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -582,13 +597,32 @@ class InferenceClient:
                 f"Pipeline node {node_id[:10]}… did not respond within "
                 f"{timeout}s (seq_pos={seq})"
             )
+        wait_ms = (time.perf_counter() - wait_start) * 1000.0
 
         rtt_ms = (time.perf_counter() - rtt_start) * 1000.0
+        fwd = result.get("forward_ms")
+        fwd_ms = float(fwd) if isinstance(fwd, (int, float)) and fwd > 0 else 0.0
+        queue = result.get("queue_ms")
+        queue_ms = float(queue) if isinstance(queue, (int, float)) and queue > 0 else 0.0
+
         if stage_idx is not None:
             self._stage_times.setdefault(stage_idx, []).append(rtt_ms)
-            fwd = result.get("forward_ms")
-            if isinstance(fwd, (int, float)) and fwd > 0:
-                self._stage_forward_times.setdefault(stage_idx, []).append(float(fwd))
+            if fwd_ms > 0:
+                self._stage_forward_times.setdefault(stage_idx, []).append(fwd_ms)
+
+        self._token_traces.append({
+            "seq": seq,
+            "stage": stage_idx,
+            "node": node_id[:12],
+            "via": via,
+            "serialize_ms": round(serialize_ms, 2),
+            "send_ms": round(send_ms, 2),
+            "wait_ms": round(wait_ms, 2),
+            "forward_ms": round(fwd_ms, 2),
+            "queue_ms": round(queue_ms, 2),
+            "rtt_ms": round(rtt_ms, 2),
+            "payload_bytes": len(inner_bytes),
+        })
 
         return result
 
@@ -782,11 +816,17 @@ class InferenceClient:
                 input_ids, max_tokens, temperature, top_p
             ):
                 self.tokens_generated += 1
-                self.emit_event({
+                elapsed_s = time.perf_counter() - self._generation_start
+                event = {
                     "type": "token",
                     "text": token_text,
                     "tokens_generated": self.tokens_generated,
-                })
+                    "tps": round(self.tokens_generated / elapsed_s, 2) if elapsed_s > 0 else 0,
+                    **self._last_token_timing,
+                }
+                if self.tokens_generated == 1:
+                    event["ttft_ms"] = round(self._ttft_ms, 2)
+                self.emit_event(event)
                 yield token_text
 
     async def _prefill_pipelined(
@@ -870,8 +910,30 @@ class InferenceClient:
             stats["tps"] = round(self.tokens_generated / (gen_elapsed / 1000.0), 2)
         else:
             stats["tps"] = 0.0
+        stats["p2p_sends"] = self._p2p_send_count
+        stats["relay_sends"] = self._relay_send_count
         self.timing_stats = stats
+
+        if self._token_traces:
+            self._write_trace_file(stats)
+
         return stats
+
+    def _write_trace_file(self, summary: dict) -> None:
+        """Write detailed per-hop traces to ~/.groove/traces/ as JSONL."""
+        import os
+        trace_dir = os.path.expanduser("~/.groove/traces")
+        os.makedirs(trace_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(trace_dir, f"trace_{ts}.jsonl")
+        try:
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "summary", **summary}) + "\n")
+                for t in self._token_traces:
+                    f.write(json.dumps(t) + "\n")
+            logger.info("trace written to %s (%d hops)", path, len(self._token_traces))
+        except Exception:
+            logger.warning("failed to write trace file")
 
     async def _autoregressive_generate(
         self,
@@ -887,20 +949,44 @@ class InferenceClient:
         self._generation_start = time.perf_counter()
         self._stage_times.clear()
         self._stage_forward_times.clear()
+        self._token_traces.clear()
         self._first_token_emitted = False
 
+        trace_idx = len(self._token_traces)
+        prefill_start = time.perf_counter()
         response = await self._prefill_pipelined(input_ids)
+        prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
         if response.get("type") == ERROR:
             raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
+        logits_start = time.perf_counter()
         logits = _logits_from_response(response)
+        logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+
+        sample_start = time.perf_counter()
         next_token = self._sample_token(
             _last_token_logits(logits), temperature, top_p
         )
+        sample_ms = (time.perf_counter() - sample_start) * 1000.0
+
         generated.append(next_token)
         self._ttft_ms = (time.perf_counter() - self._generation_start) * 1000.0
         self._first_token_emitted = True
-        yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+        decode_start = time.perf_counter()
+        text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+        decode_ms = (time.perf_counter() - decode_start) * 1000.0
+
+        self._last_token_timing = {
+            "token_ms": round(prefill_ms + logits_deser_ms + sample_ms + decode_ms, 2),
+            "prefill_ms": round(prefill_ms, 2),
+            "logits_deser_ms": round(logits_deser_ms, 2),
+            "sample_ms": round(sample_ms, 2),
+            "decode_ms": round(decode_ms, 2),
+            "is_prefill": True,
+            "stages": self._token_traces[trace_idx:],
+        }
+        yield text
 
         if use_pipeline:
             async for text in self._pipelined_token_generate(
@@ -912,6 +998,9 @@ class InferenceClient:
                 if next_token == eos_id:
                     break
 
+                trace_idx = len(self._token_traces)
+                token_start = time.perf_counter()
+
                 token_tensor = torch.tensor([next_token], dtype=torch.int64)
                 msg = make_activations(
                     self.session_id,
@@ -922,16 +1011,39 @@ class InferenceClient:
                 )
                 msg["is_prompt"] = False
 
+                pipeline_start = time.perf_counter()
                 response = await self.send_to_pipeline(msg)
+                pipeline_ms = (time.perf_counter() - pipeline_start) * 1000.0
                 if response.get("type") == ERROR:
                     raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
+                logits_start = time.perf_counter()
                 logits = _logits_from_response(response)
+                logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+
+                sample_start = time.perf_counter()
                 next_token = self._sample_token(
                     _last_token_logits(logits), temperature, top_p
                 )
+                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+
                 generated.append(next_token)
-                yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+                decode_start = time.perf_counter()
+                text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                decode_ms = (time.perf_counter() - decode_start) * 1000.0
+
+                token_ms = (time.perf_counter() - token_start) * 1000.0
+                self._last_token_timing = {
+                    "token_ms": round(token_ms, 2),
+                    "pipeline_ms": round(pipeline_ms, 2),
+                    "logits_deser_ms": round(logits_deser_ms, 2),
+                    "sample_ms": round(sample_ms, 2),
+                    "decode_ms": round(decode_ms, 2),
+                    "is_prefill": False,
+                    "stages": self._token_traces[trace_idx:],
+                }
+                yield text
 
         timing = self._finalize_timing()
         logger.info("generation timing: %s", json.dumps(timing))
@@ -996,6 +1108,9 @@ class InferenceClient:
                 if next_token == eos_id:
                     break
 
+                trace_idx = len(self._token_traces)
+                token_start = time.perf_counter()
+
                 token_tensor = torch.tensor([next_token], dtype=torch.int64)
                 msg = make_activations(
                     self.session_id,
@@ -1014,16 +1129,38 @@ class InferenceClient:
                         raise stage_errors[0]
                     raise RuntimeError("Pipeline stage terminated unexpectedly")
                 response, seq_idx = item
+                pipeline_ms = (time.perf_counter() - token_start) * 1000.0
 
                 if response.get("type") == ERROR:
                     raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
+                logits_start = time.perf_counter()
                 logits = _logits_from_response(response)
+                logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+
+                sample_start = time.perf_counter()
                 next_token = self._sample_token(
                     _last_token_logits(logits), temperature, top_p
                 )
+                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+
                 generated.append(next_token)
-                yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+                decode_start = time.perf_counter()
+                text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                decode_ms = (time.perf_counter() - decode_start) * 1000.0
+
+                token_ms = (time.perf_counter() - token_start) * 1000.0
+                self._last_token_timing = {
+                    "token_ms": round(token_ms, 2),
+                    "pipeline_ms": round(pipeline_ms, 2),
+                    "logits_deser_ms": round(logits_deser_ms, 2),
+                    "sample_ms": round(sample_ms, 2),
+                    "decode_ms": round(decode_ms, 2),
+                    "is_prefill": False,
+                    "stages": self._token_traces[trace_idx:],
+                }
+                yield text
         finally:
             await stage_queues[0].put(_SENTINEL)
             for w in workers:

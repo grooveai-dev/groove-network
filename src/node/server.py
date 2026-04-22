@@ -130,6 +130,14 @@ def _capabilities(
                 vram_used_mb = int(parts[1])
         except Exception:
             pass
+    elif device == "mps":
+        try:
+            vram_used_mb = int(torch.mps.current_allocated_memory() / (1024 * 1024))
+            driver_mb = int(torch.mps.driver_allocated_memory() / (1024 * 1024))
+            if vram_mb > 0:
+                gpu_utilization_pct = min(100, int(vram_used_mb * 100 / vram_mb))
+        except Exception:
+            pass
 
     caps = {
         "ram_mb": ram_mb,
@@ -456,6 +464,8 @@ class ComputeNodeServer:
 
             stream_id = frame.get("stream_id")
             payload = frame.get("payload")
+            hop_start = time.perf_counter()
+
             try:
                 inner = msgpack.unpackb(
                     payload, raw=False,
@@ -467,6 +477,9 @@ class ComputeNodeServer:
             except Exception:
                 logger.exception("inner payload decode failed stream_id=%s", stream_id)
                 continue
+
+            deserialize_ms = (time.perf_counter() - hop_start) * 1000.0
+            dispatch_start = time.perf_counter()
 
             try:
                 response = await self._dispatch(inner)
@@ -497,8 +510,12 @@ class ComputeNodeServer:
             if response is None:
                 continue
 
+            dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
+            serialize_start = time.perf_counter()
             response_bytes = msgpack.packb(response, use_bin_type=True)
+            serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
 
+            send_start = time.perf_counter()
             downstream = self.downstream_peer
             if downstream and downstream in self.p2p_channels:
                 try:
@@ -520,6 +537,24 @@ class ComputeNodeServer:
                     await ws.send(encode_message(outbound))
                 except (websockets.ConnectionClosed, OSError):
                     return
+            send_ms = (time.perf_counter() - send_start) * 1000.0
+            total_ms = (time.perf_counter() - hop_start) * 1000.0
+
+            logger.info(
+                "relay hop",
+                extra={
+                    "stream_id": stream_id,
+                    "seq": inner.get("seq_pos"),
+                    "deserialize_ms": round(deserialize_ms, 2),
+                    "dispatch_ms": round(dispatch_ms, 2),
+                    "forward_ms": round(response.get("forward_ms", 0), 2),
+                    "queue_ms": round(response.get("queue_ms", 0), 2),
+                    "serialize_ms": round(serialize_ms, 2),
+                    "send_ms": round(send_ms, 2),
+                    "total_ms": round(total_ms, 2),
+                    "response_bytes": len(response_bytes),
+                },
+            )
 
     async def _load_shard_async(self, model_name: str, layer_start: int, layer_end: int) -> dict:
         loop = asyncio.get_event_loop()
@@ -1050,6 +1085,8 @@ class ComputeNodeServer:
                 if complete is None:
                     continue
 
+                hop_start = time.perf_counter()
+
                 try:
                     inner = msgpack.unpackb(
                         complete, raw=False,
@@ -1061,6 +1098,9 @@ class ComputeNodeServer:
                 except Exception:
                     logger.exception("P2P payload decode failed from %s", peer_id[:12])
                     continue
+
+                deserialize_ms = (time.perf_counter() - hop_start) * 1000.0
+                dispatch_start = time.perf_counter()
 
                 try:
                     response = await self._dispatch(inner)
@@ -1090,7 +1130,12 @@ class ComputeNodeServer:
                 if response is None:
                     continue
 
+                dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
+                serialize_start = time.perf_counter()
                 response_bytes = msgpack.packb(response, use_bin_type=True)
+                serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
+
+                send_start = time.perf_counter()
                 try:
                     await channel.send_message(response_bytes)
                 except Exception:
@@ -1106,6 +1151,24 @@ class ComputeNodeServer:
                         await ws.send(encode_message(outbound))
                     except (websockets.ConnectionClosed, OSError):
                         return
+                send_ms = (time.perf_counter() - send_start) * 1000.0
+                total_ms = (time.perf_counter() - hop_start) * 1000.0
+
+                logger.info(
+                    "P2P hop",
+                    extra={
+                        "peer": peer_id[:12],
+                        "seq": inner.get("seq_pos"),
+                        "deserialize_ms": round(deserialize_ms, 2),
+                        "dispatch_ms": round(dispatch_ms, 2),
+                        "forward_ms": round(response.get("forward_ms", 0), 2),
+                        "queue_ms": round(response.get("queue_ms", 0), 2),
+                        "serialize_ms": round(serialize_ms, 2),
+                        "send_ms": round(send_ms, 2),
+                        "total_ms": round(total_ms, 2),
+                        "response_bytes": len(response_bytes),
+                    },
+                )
         except asyncio.CancelledError:
             return
         except Exception:
