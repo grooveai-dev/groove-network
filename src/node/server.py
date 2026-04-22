@@ -869,6 +869,12 @@ class ComputeNodeServer:
 
         if is_last_shard:
             sampling = self._session_sampling.get(session_id)
+            temperature = msg.get("temperature")
+            if temperature is not None:
+                sampling = {
+                    "temperature": float(temperature),
+                    "top_p": float(msg.get("top_p", 0.9)),
+                }
             if sampling:
                 sample_start = time.perf_counter()
                 token_id = self._sample_from_logits(

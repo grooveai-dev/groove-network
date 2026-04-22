@@ -551,6 +551,10 @@ class InferenceClient:
         fut: asyncio.Future = loop.create_future()
         self._waiters[seq] = fut
 
+        if hasattr(self, "_session_temperature"):
+            inner["temperature"] = self._session_temperature
+            inner["top_p"] = self._session_top_p
+
         serialize_start = time.perf_counter()
         inner_bytes = msgpack.packb(inner, use_bin_type=True)
         serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
