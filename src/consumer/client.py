@@ -45,6 +45,7 @@ from src.common.protocol import (
     PROTOCOL_VERSION,
     SDP_ANSWER,
     SDP_OFFER,
+    TOKEN_RESULT,
     VERIFY_RESULT,
     decode_message,
     encode_message,
@@ -142,7 +143,8 @@ class InferenceClient:
             })
 
     async def start_session(
-        self, model_name: str, config: Optional[dict] = None
+        self, model_name: str, config: Optional[dict] = None,
+        temperature: float = 0.7, top_p: float = 0.9,
     ) -> str:
         from transformers import AutoTokenizer
 
@@ -151,8 +153,15 @@ class InferenceClient:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=False,
         )
+        self._session_temperature = temperature
+        self._session_top_p = top_p
 
-        init = make_session_init(self.session_id, model_name, 0, -1, config or {})
+        session_config = dict(config or {})
+        session_config["node_side_sampling"] = True
+        session_config["temperature"] = temperature
+        session_config["top_p"] = top_p
+
+        init = make_session_init(self.session_id, model_name, 0, -1, session_config)
         await self.relay_ws.send(encode_message(init))
 
         raw = await self.relay_ws.recv()
@@ -656,7 +665,7 @@ class InferenceClient:
                 for node in self.pipeline:
                     response = await self._send_to_node(node["node_id"], msg)
                     t = response.get("type")
-                    if t in (LOGITS, VERIFY_RESULT, ERROR):
+                    if t in (LOGITS, TOKEN_RESULT, VERIFY_RESULT, ERROR):
                         return response
                     if t == ACTIVATIONS:
                         msg = response
@@ -694,7 +703,7 @@ class InferenceClient:
         for idx, node in enumerate(self.pipeline):
             response = await self._send_to_node(node["node_id"], msg, stage_idx=idx)
             t = response.get("type")
-            if t in (LOGITS, VERIFY_RESULT, ERROR):
+            if t in (LOGITS, TOKEN_RESULT, VERIFY_RESULT, ERROR):
                 return response
             if t == ACTIVATIONS:
                 msg = response
@@ -1021,15 +1030,21 @@ class InferenceClient:
         if response.get("type") == ERROR:
             raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
-        logits_start = time.perf_counter()
-        logits = _logits_from_response(response)
-        logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+        logits_deser_ms = 0.0
+        sample_ms = 0.0
+        if response.get("type") == TOKEN_RESULT:
+            next_token = response["token_id"]
+            sample_ms = response.get("sample_ms", 0.0)
+        else:
+            logits_start = time.perf_counter()
+            logits = _logits_from_response(response)
+            logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
 
-        sample_start = time.perf_counter()
-        next_token = self._sample_token(
-            _last_token_logits(logits), temperature, top_p
-        )
-        sample_ms = (time.perf_counter() - sample_start) * 1000.0
+            sample_start = time.perf_counter()
+            next_token = self._sample_token(
+                _last_token_logits(logits), temperature, top_p
+            )
+            sample_ms = (time.perf_counter() - sample_start) * 1000.0
 
         generated.append(next_token)
         self._ttft_ms = (time.perf_counter() - self._generation_start) * 1000.0
@@ -1046,6 +1061,7 @@ class InferenceClient:
             "sample_ms": round(sample_ms, 2),
             "decode_ms": round(decode_ms, 2),
             "is_prefill": True,
+            "node_sampled": response.get("type") == TOKEN_RESULT,
             "stages": self._token_traces[trace_idx:],
         }
         yield text
@@ -1079,15 +1095,21 @@ class InferenceClient:
                 if response.get("type") == ERROR:
                     raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
-                logits_start = time.perf_counter()
-                logits = _logits_from_response(response)
-                logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+                logits_deser_ms = 0.0
+                sample_ms = 0.0
+                if response.get("type") == TOKEN_RESULT:
+                    next_token = response["token_id"]
+                    sample_ms = response.get("sample_ms", 0.0)
+                else:
+                    logits_start = time.perf_counter()
+                    logits = _logits_from_response(response)
+                    logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
 
-                sample_start = time.perf_counter()
-                next_token = self._sample_token(
-                    _last_token_logits(logits), temperature, top_p
-                )
-                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+                    sample_start = time.perf_counter()
+                    next_token = self._sample_token(
+                        _last_token_logits(logits), temperature, top_p
+                    )
+                    sample_ms = (time.perf_counter() - sample_start) * 1000.0
 
                 generated.append(next_token)
 
@@ -1103,6 +1125,7 @@ class InferenceClient:
                     "sample_ms": round(sample_ms, 2),
                     "decode_ms": round(decode_ms, 2),
                     "is_prefill": False,
+                    "node_sampled": response.get("type") == TOKEN_RESULT,
                     "stages": self._token_traces[trace_idx:],
                 }
                 yield text
@@ -1153,7 +1176,7 @@ class InferenceClient:
                         node["node_id"], msg, stage_idx=idx,
                     )
                     t = response.get("type")
-                    if t in (LOGITS, VERIFY_RESULT, ERROR):
+                    if t in (LOGITS, TOKEN_RESULT, VERIFY_RESULT, ERROR):
                         await out_q.put((response, seq_idx))
                     elif t == ACTIVATIONS:
                         await out_q.put((response, seq_idx))
@@ -1196,15 +1219,21 @@ class InferenceClient:
                 if response.get("type") == ERROR:
                     raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
-                logits_start = time.perf_counter()
-                logits = _logits_from_response(response)
-                logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+                logits_deser_ms = 0.0
+                sample_ms = 0.0
+                if response.get("type") == TOKEN_RESULT:
+                    next_token = response["token_id"]
+                    sample_ms = response.get("sample_ms", 0.0)
+                else:
+                    logits_start = time.perf_counter()
+                    logits = _logits_from_response(response)
+                    logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
 
-                sample_start = time.perf_counter()
-                next_token = self._sample_token(
-                    _last_token_logits(logits), temperature, top_p
-                )
-                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+                    sample_start = time.perf_counter()
+                    next_token = self._sample_token(
+                        _last_token_logits(logits), temperature, top_p
+                    )
+                    sample_ms = (time.perf_counter() - sample_start) * 1000.0
 
                 generated.append(next_token)
 
@@ -1220,6 +1249,7 @@ class InferenceClient:
                     "sample_ms": round(sample_ms, 2),
                     "decode_ms": round(decode_ms, 2),
                     "is_prefill": False,
+                    "node_sampled": response.get("type") == TOKEN_RESULT,
                     "stages": self._token_traces[trace_idx:],
                 }
                 yield text

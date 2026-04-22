@@ -61,6 +61,7 @@ from src.common.protocol import (
     make_p2p_ready,
     make_register_node,
     make_sdp_answer,
+    make_token_result,
     make_verify_result,
 )
 from src.common.benchmark import classify_node_role, run_node_benchmark
@@ -237,6 +238,7 @@ class ComputeNodeServer:
         self.upstream_peer: str | None = None
         self.downstream_peer: str | None = None
         self.p2p_channels: dict[str, ChunkedChannel] = {}
+        self._session_sampling: dict[str, dict] = {}
 
         self._gpu_model_cached: str = ""
         if torch.cuda.is_available():
@@ -801,8 +803,22 @@ class ComputeNodeServer:
             return err
         session_id = msg["session_id"]
         num_layers = self.layer_end - self.layer_start
-        max_ctx = msg.get("config", {}).get("max_context", self.max_context)
+        config = msg.get("config", {})
+        max_ctx = config.get("max_context", self.max_context)
         self.kv_manager.create_session(session_id, num_layers, max_ctx)
+
+        if config.get("node_side_sampling"):
+            self._session_sampling[session_id] = {
+                "temperature": config.get("temperature", 0.7),
+                "top_p": config.get("top_p", 0.9),
+            }
+            logger.info("session %s: node-side sampling enabled (temp=%.2f top_p=%.2f)",
+                        session_id,
+                        self._session_sampling[session_id]["temperature"],
+                        self._session_sampling[session_id]["top_p"])
+        else:
+            self._session_sampling.pop(session_id, None)
+
         logger.info("session %s initialized", session_id)
         return make_heartbeat(self.node_id, status="session_ready")
 
@@ -848,12 +864,30 @@ class ComputeNodeServer:
         forward_ms = (time.perf_counter() - forward_start) * 1000.0
 
         is_last_shard = self.shard["lm_head"] is not None
-        output_bytes = serialize_tensor(output)
-        dtype = str(output.dtype).replace("torch.", "")
 
         telemetry = self._node_telemetry()
 
         if is_last_shard:
+            sampling = self._session_sampling.get(session_id)
+            if sampling:
+                sample_start = time.perf_counter()
+                token_id = self._sample_from_logits(
+                    output, sampling["temperature"], sampling["top_p"],
+                )
+                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+                resp = make_token_result(
+                    session_id=session_id,
+                    seq_pos=msg["seq_pos"],
+                    token_id=token_id,
+                    forward_ms=round(forward_ms, 2),
+                    queue_ms=round(queue_ms, 2),
+                    sample_ms=round(sample_ms, 2),
+                )
+                resp["node_telemetry"] = telemetry
+                return resp
+
+            output_bytes = serialize_tensor(output)
+            dtype = str(output.dtype).replace("torch.", "")
             resp = make_logits(
                 session_id=session_id,
                 seq_pos=msg["seq_pos"],
@@ -865,6 +899,9 @@ class ComputeNodeServer:
             )
             resp["node_telemetry"] = telemetry
             return resp
+
+        output_bytes = serialize_tensor(output)
+        dtype = str(output.dtype).replace("torch.", "")
         resp = make_activations(
             session_id=session_id,
             seq_pos=msg["seq_pos"],
@@ -876,6 +913,22 @@ class ComputeNodeServer:
         )
         resp["node_telemetry"] = telemetry
         return resp
+
+    def _sample_from_logits(
+        self, logits: torch.Tensor, temperature: float, top_p: float,
+    ) -> int:
+        logits = logits[:, -1, :].float() if logits.dim() == 3 else logits[-1].float()
+        if temperature <= 0:
+            return int(logits.argmax().item())
+        logits = logits / temperature
+        probs = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumsum - sorted_probs > top_p
+        sorted_probs[mask] = 0.0
+        sorted_probs /= sorted_probs.sum()
+        idx = torch.multinomial(sorted_probs, num_samples=1)
+        return int(sorted_indices[idx].item())
 
     @torch.inference_mode()
     async def _handle_spec_window(self, msg: dict) -> dict:

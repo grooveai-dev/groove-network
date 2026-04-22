@@ -38,6 +38,7 @@ AUTH_CHALLENGE = "auth_challenge"
 AUTH_RESPONSE = "auth_response"
 PIPELINE_MESH = "pipeline_mesh"
 KV_TRIM = "kv_trim"
+TOKEN_RESULT = "token_result"
 
 # WebRTC P2P signaling message types.
 SDP_OFFER = "sdp_offer"
@@ -59,7 +60,7 @@ ALL_MESSAGE_TYPES = frozenset({
     REGISTER_NODE, REGISTER_ACK, DEREGISTER, ENVELOPE,
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
-    PIPELINE_MESH, KV_TRIM,
+    PIPELINE_MESH, KV_TRIM, TOKEN_RESULT,
     SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
@@ -262,6 +263,29 @@ def make_logits(
         msg["forward_ms"] = forward_ms
     if queue_ms is not None:
         msg["queue_ms"] = queue_ms
+    return msg
+
+
+def make_token_result(
+    session_id: str,
+    seq_pos: int,
+    token_id: int,
+    forward_ms: float | None = None,
+    queue_ms: float | None = None,
+    sample_ms: float | None = None,
+) -> dict:
+    msg = {
+        "type": TOKEN_RESULT,
+        "session_id": session_id,
+        "seq_pos": seq_pos,
+        "token_id": token_id,
+    }
+    if forward_ms is not None:
+        msg["forward_ms"] = forward_ms
+    if queue_ms is not None:
+        msg["queue_ms"] = queue_ms
+    if sample_ms is not None:
+        msg["sample_ms"] = sample_ms
     return msg
 
 
