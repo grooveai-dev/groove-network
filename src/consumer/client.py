@@ -810,6 +810,8 @@ class InferenceClient:
         use_speculative: bool | None = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        system_prompt: str = "You are a helpful assistant.",
+        raw_mode: bool = False,
     ) -> AsyncGenerator[str, None]:
         if not self.session_id or not self.tokenizer:
             raise RuntimeError("No active session. Call start_session() first.")
@@ -817,7 +819,19 @@ class InferenceClient:
         if use_speculative is None:
             use_speculative = len(self.pipeline) == 1
 
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
+        if raw_mode:
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
+        elif hasattr(self.tokenizer, "apply_chat_template"):
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            input_ids = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        else:
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
 
         if use_speculative:
             from src.consumer.speculative import SpeculativeDecoder
@@ -1018,6 +1032,10 @@ class InferenceClient:
     ) -> AsyncGenerator[str, None]:
         generated = list(input_ids)
         eos_id = self.tokenizer.eos_token_id
+        stop_ids = {eos_id}
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end_id, int) and im_end_id != self.tokenizer.unk_token_id:
+            stop_ids.add(im_end_id)
         use_pipeline = len(self.pipeline) > 1
 
         self._generation_start = time.perf_counter()
@@ -1077,7 +1095,7 @@ class InferenceClient:
                 yield text
         else:
             for _ in range(max_tokens - 1):
-                if next_token == eos_id:
+                if next_token in stop_ids:
                     break
 
                 trace_idx = len(self._token_traces)
@@ -1156,6 +1174,10 @@ class InferenceClient:
         handoff without returning to the consumer between stages.
         """
         eos_id = self.tokenizer.eos_token_id
+        stop_ids = {eos_id}
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end_id, int) and im_end_id != self.tokenizer.unk_token_id:
+            stop_ids.add(im_end_id)
         next_token = first_token
         num_stages = len(self.pipeline)
 
@@ -1194,7 +1216,7 @@ class InferenceClient:
 
         try:
             for _ in range(remaining_tokens):
-                if next_token == eos_id:
+                if next_token in stop_ids:
                     break
 
                 trace_idx = len(self._token_traces)
