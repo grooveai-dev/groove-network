@@ -7,6 +7,8 @@ Usage:
     python scripts/analyze_trace.py --compare trace1.jsonl trace2.jsonl
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
