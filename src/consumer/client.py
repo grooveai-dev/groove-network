@@ -625,6 +625,10 @@ class InferenceClient:
             if fwd_ms > 0:
                 self._stage_forward_times.setdefault(stage_idx, []).append(fwd_ms)
 
+        resp_type = result.get("type", "unknown")
+        resp_data = result.get("hidden_states_bytes") or result.get("data", b"")
+        resp_bytes = len(resp_data) if isinstance(resp_data, (bytes, bytearray)) else 0
+
         trace_entry = {
             "seq": seq,
             "stage": stage_idx,
@@ -636,8 +640,15 @@ class InferenceClient:
             "forward_ms": round(fwd_ms, 2),
             "queue_ms": round(queue_ms, 2),
             "rtt_ms": round(rtt_ms, 2),
-            "payload_bytes": len(inner_bytes),
+            "request_bytes": len(inner_bytes),
+            "response_type": resp_type,
+            "response_bytes": resp_bytes,
         }
+        if resp_type == TOKEN_RESULT:
+            trace_entry["node_sampled"] = True
+            s_ms = result.get("sample_ms")
+            if s_ms is not None:
+                trace_entry["sample_ms"] = round(float(s_ms), 2)
         node_telem = result.get("node_telemetry")
         if node_telem:
             trace_entry["node_telemetry"] = node_telem
