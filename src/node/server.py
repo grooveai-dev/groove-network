@@ -238,6 +238,51 @@ class ComputeNodeServer:
         self.downstream_peer: str | None = None
         self.p2p_channels: dict[str, ChunkedChannel] = {}
 
+        self._gpu_model_cached: str = ""
+        if torch.cuda.is_available():
+            try:
+                self._gpu_model_cached = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+        elif device == "mps":
+            self._gpu_model_cached = "Apple Silicon"
+
+    def _node_telemetry(self) -> dict:
+        """Lightweight resource snapshot attached to every inference response."""
+        telem: dict = {
+            "node_id": self.node_id[:12],
+            "device": self.device,
+            "gpu_model": self._gpu_model_cached,
+        }
+        if self.layer_start is not None and self.layer_end is not None:
+            telem["layers"] = [self.layer_start, self.layer_end]
+
+        if torch.cuda.is_available():
+            try:
+                telem["vram_used_mb"] = int(torch.cuda.memory_allocated(0) / (1024 * 1024))
+                telem["vram_peak_mb"] = int(torch.cuda.max_memory_allocated(0) / (1024 * 1024))
+                telem["vram_total_mb"] = int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+            except Exception:
+                pass
+        elif self.device == "mps":
+            try:
+                telem["vram_used_mb"] = int(torch.mps.current_allocated_memory() / (1024 * 1024))
+                telem["vram_peak_mb"] = int(torch.mps.driver_allocated_memory() / (1024 * 1024))
+            except Exception:
+                pass
+
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            telem["ram_used_mb"] = int(mem.used / (1024 * 1024))
+            telem["ram_total_mb"] = int(mem.total / (1024 * 1024))
+            telem["ram_pct"] = round(mem.percent, 1)
+            telem["cpu_pct"] = round(psutil.cpu_percent(interval=0), 1)
+        except Exception:
+            pass
+
+        return telem
+
     async def load(self) -> None:
         if self.model_name is None or self.layer_start is None or self.layer_end is None:
             raise RuntimeError(
@@ -806,8 +851,10 @@ class ComputeNodeServer:
         output_bytes = serialize_tensor(output)
         dtype = str(output.dtype).replace("torch.", "")
 
+        telemetry = self._node_telemetry()
+
         if is_last_shard:
-            return make_logits(
+            resp = make_logits(
                 session_id=session_id,
                 seq_pos=msg["seq_pos"],
                 logits_bytes=output_bytes,
@@ -816,7 +863,9 @@ class ComputeNodeServer:
                 forward_ms=round(forward_ms, 2),
                 queue_ms=round(queue_ms, 2),
             )
-        return make_activations(
+            resp["node_telemetry"] = telemetry
+            return resp
+        resp = make_activations(
             session_id=session_id,
             seq_pos=msg["seq_pos"],
             hidden_states_bytes=output_bytes,
@@ -825,6 +874,8 @@ class ComputeNodeServer:
             forward_ms=round(forward_ms, 2),
             queue_ms=round(queue_ms, 2),
         )
+        resp["node_telemetry"] = telemetry
+        return resp
 
     @torch.inference_mode()
     async def _handle_spec_window(self, msg: dict) -> dict:

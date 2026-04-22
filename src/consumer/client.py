@@ -610,7 +610,7 @@ class InferenceClient:
             if fwd_ms > 0:
                 self._stage_forward_times.setdefault(stage_idx, []).append(fwd_ms)
 
-        self._token_traces.append({
+        trace_entry = {
             "seq": seq,
             "stage": stage_idx,
             "node": node_id[:12],
@@ -622,7 +622,11 @@ class InferenceClient:
             "queue_ms": round(queue_ms, 2),
             "rtt_ms": round(rtt_ms, 2),
             "payload_bytes": len(inner_bytes),
-        })
+        }
+        node_telem = result.get("node_telemetry")
+        if node_telem:
+            trace_entry["node_telemetry"] = node_telem
+        self._token_traces.append(trace_entry)
 
         return result
 
@@ -926,9 +930,31 @@ class InferenceClient:
         os.makedirs(trace_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(trace_dir, f"trace_{ts}.jsonl")
+
+        pipeline_meta = []
+        for node in self.pipeline:
+            pipeline_meta.append({
+                "node_id": node.get("node_id", "")[:12],
+                "device": node.get("device"),
+                "layers": [node.get("layer_start"), node.get("layer_end")],
+                "gpu_model": node.get("gpu_model", ""),
+                "score": node.get("score"),
+            })
+
+        node_resources = {}
+        for t in self._token_traces:
+            telem = t.get("node_telemetry")
+            if telem and telem.get("node_id"):
+                node_resources[telem["node_id"]] = telem
+
+        summary["pipeline"] = pipeline_meta
+        summary["node_count"] = len(self.pipeline)
+        summary["model"] = self.model_name
+        summary["node_resources"] = list(node_resources.values())
+
         try:
             with open(path, "w") as f:
-                f.write(json.dumps({"type": "summary", **summary}) + "\n")
+                f.write(json.dumps(summary) + "\n")
                 for t in self._token_traces:
                     f.write(json.dumps(t) + "\n")
             logger.info("trace written to %s (%d hops)", path, len(self._token_traces))
