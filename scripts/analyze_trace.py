@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/analyze_trace.py                    # latest trace
+    python scripts/analyze_trace.py --live              # watch inference in real time
     python scripts/analyze_trace.py ~/.groove/traces/trace_20260422_143804.jsonl
     python scripts/analyze_trace.py --compare trace1.jsonl trace2.jsonl
     python scripts/analyze_trace.py --benchmark         # compare all traces
@@ -354,6 +355,131 @@ def compare(paths: list, labels: list = None) -> None:
     print()
 
 
+def live(path: str = "") -> None:
+    """Watch a trace file in real time during inference."""
+    import time as _time
+
+    trace_dir = os.path.expanduser("~/.groove/traces")
+
+    if not path:
+        print("  Waiting for inference to start...")
+        print(f"  Watching {trace_dir}/")
+        print("  Press Ctrl+C to stop\n")
+
+        existing = set(Path(trace_dir).glob("trace_*.jsonl")) if os.path.isdir(trace_dir) else set()
+        while True:
+            _time.sleep(0.3)
+            if not os.path.isdir(trace_dir):
+                continue
+            current = set(Path(trace_dir).glob("trace_*.jsonl"))
+            new = current - existing
+            if new:
+                path = str(sorted(new)[-1])
+                break
+
+    print(f"{'=' * 78}")
+    print(f"  LIVE TRACE \u2014 {Path(path).name}")
+    print(f"{'=' * 78}\n")
+
+    seen = 0
+    nodes = {}
+    token_count = 0
+    first_hop_time = None
+    last_hop_time = None
+
+    try:
+        while True:
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                _time.sleep(0.3)
+                continue
+
+            if len(lines) <= seen:
+                _time.sleep(0.1)
+
+                if seen > 0 and last_hop_time:
+                    idle = _time.time() - last_hop_time
+                    if idle > 10:
+                        print(f"\n  \u2501\u2501 Inference complete ({token_count} hops traced) \u2501\u2501\n")
+                        break
+                continue
+
+            for line in lines[seen:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if entry.get("type") == "summary" or ("tps" in entry and "tokens_generated" in entry):
+                    tps = entry.get("tps", 0)
+                    tokens = entry.get("tokens_generated", 0)
+                    ttft = entry.get("ttft_ms", 0)
+                    p2p = entry.get("p2p_sends", 0)
+                    relay = entry.get("relay_sends", 0)
+                    print(f"\n  {'=' * 74}")
+                    print(f"  FINAL: {tokens} tokens  {tps:.2f} TPS  TTFT={ttft:.0f}ms  P2P={p2p} Relay={relay}")
+
+                    nr = entry.get("node_resources", [])
+                    if nr:
+                        print(f"\n  Node resources:")
+                        for n in nr:
+                            nid = n.get("node_id", "?")
+                            dev = n.get("device", "?")
+                            gpu = n.get("gpu_model", "")
+                            vram = n.get("vram_used_mb", 0)
+                            print(f"    {nid} {dev} {gpu}: VRAM={fmt_mb(vram)}")
+
+                    print(f"  {'=' * 74}\n")
+                    return
+
+                seq = entry.get("seq")
+                stage = entry.get("stage", "?")
+                node = entry.get("node", "?")
+                via = entry.get("via", "?")
+                rtt = entry.get("rtt_ms", 0)
+                fwd = entry.get("forward_ms", 0)
+                send = entry.get("send_ms", 0)
+                payload = entry.get("payload_bytes", 0)
+
+                now = _time.time()
+                if first_hop_time is None:
+                    first_hop_time = now
+                last_hop_time = now
+                token_count += 1
+                elapsed = now - first_hop_time
+
+                telem = entry.get("node_telemetry", {})
+                vram_str = ""
+                if telem:
+                    nid = telem.get("node_id", node)
+                    nodes[nid] = telem
+                    vram = telem.get("vram_used_mb", 0)
+                    if vram:
+                        vram_str = f"  VRAM={fmt_mb(vram)}"
+
+                via_icon = "\u26a1" if via == "p2p" else "\u2601\ufe0f "
+                print(
+                    f"  {elapsed:6.1f}s  seq={seq:<4}  "
+                    f"s{stage} {node} {via_icon}  "
+                    f"rtt={rtt:6.1f}ms  fwd={fwd:6.1f}ms  "
+                    f"send={send:.1f}ms  {payload}B"
+                    f"{vram_str}"
+                )
+
+            seen = len(lines)
+
+    except KeyboardInterrupt:
+        print(f"\n\n  Stopped. {token_count} hops captured.")
+        if nodes:
+            print(f"  Nodes seen: {', '.join(nodes.keys())}")
+        print()
+
+
 def find_traces(n: int = 0) -> list:
     trace_dir = os.path.expanduser("~/.groove/traces")
     if not os.path.isdir(trace_dir):
@@ -379,6 +505,11 @@ def main():
             print("Traces are written to ~/.groove/traces/")
             sys.exit(1)
         analyze(path)
+        return
+
+    if args[0] == "--live":
+        path = args[1] if len(args) > 1 else ""
+        live(path)
         return
 
     if args[0] == "--benchmark":

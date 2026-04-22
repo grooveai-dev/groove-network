@@ -117,6 +117,8 @@ class InferenceClient:
         self._max_reconnect_per_peer: int = 3
         self._token_traces: list[dict] = []
         self._last_token_timing: dict = {}
+        self._live_trace_path: str = ""
+        self._live_trace_file = None
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -628,6 +630,13 @@ class InferenceClient:
             trace_entry["node_telemetry"] = node_telem
         self._token_traces.append(trace_entry)
 
+        if self._live_trace_file:
+            try:
+                self._live_trace_file.write(json.dumps(trace_entry) + "\n")
+                self._live_trace_file.flush()
+            except Exception:
+                pass
+
         return result
 
     async def send_to_pipeline(self, message: dict) -> dict:
@@ -923,13 +932,31 @@ class InferenceClient:
 
         return stats
 
-    def _write_trace_file(self, summary: dict) -> None:
-        """Write detailed per-hop traces to ~/.groove/traces/ as JSONL."""
+    def _open_live_trace(self) -> None:
+        """Open a trace file for live streaming. Hops are appended in real time."""
         import os
+        if self._live_trace_file:
+            try:
+                self._live_trace_file.close()
+            except Exception:
+                pass
         trace_dir = os.path.expanduser("~/.groove/traces")
         os.makedirs(trace_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(trace_dir, f"trace_{ts}.jsonl")
+        self._live_trace_path = os.path.join(trace_dir, f"trace_{ts}.jsonl")
+        try:
+            self._live_trace_file = open(self._live_trace_path, "w")
+        except Exception:
+            self._live_trace_file = None
+
+    def _write_trace_file(self, summary: dict) -> None:
+        """Finalize trace: rewrite file with summary header + all hops."""
+        if self._live_trace_file:
+            try:
+                self._live_trace_file.close()
+            except Exception:
+                pass
+            self._live_trace_file = None
 
         pipeline_meta = []
         for node in self.pipeline:
@@ -951,6 +978,14 @@ class InferenceClient:
         summary["node_count"] = len(self.pipeline)
         summary["model"] = self.model_name
         summary["node_resources"] = list(node_resources.values())
+
+        path = self._live_trace_path
+        if not path:
+            import os
+            trace_dir = os.path.expanduser("~/.groove/traces")
+            os.makedirs(trace_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(trace_dir, f"trace_{ts}.jsonl")
 
         try:
             with open(path, "w") as f:
@@ -977,6 +1012,7 @@ class InferenceClient:
         self._stage_forward_times.clear()
         self._token_traces.clear()
         self._first_token_emitted = False
+        self._open_live_trace()
 
         trace_idx = len(self._token_traces)
         prefill_start = time.perf_counter()
