@@ -924,6 +924,7 @@ class ComputeNodeServer:
         self, logits: torch.Tensor, temperature: float, top_p: float,
     ) -> int:
         logits = logits[:, -1, :].float() if logits.dim() == 3 else logits[-1].float()
+        logits = logits.squeeze(0) if logits.dim() > 1 else logits
         if temperature <= 0:
             return int(logits.argmax().item())
         logits = logits / temperature
@@ -934,7 +935,7 @@ class ComputeNodeServer:
         sorted_probs[mask] = 0.0
         sorted_probs /= sorted_probs.sum()
         idx = torch.multinomial(sorted_probs, num_samples=1)
-        return int(sorted_indices[idx].item())
+        return int(sorted_indices[idx.item()].item())
 
     @torch.inference_mode()
     async def _handle_spec_window(self, msg: dict) -> dict:
