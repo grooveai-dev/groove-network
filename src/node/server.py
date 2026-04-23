@@ -946,6 +946,9 @@ class ComputeNodeServer:
         resp["node_telemetry"] = telemetry
 
         if self.downstream_peer and self.downstream_peer in self.p2p_channels:
+            if "temperature" in msg:
+                resp["temperature"] = msg["temperature"]
+                resp["top_p"] = msg.get("top_p", 0.9)
             if hasattr(self, "_session_temperature"):
                 resp["temperature"] = self._session_temperature
                 resp["top_p"] = self._session_top_p
