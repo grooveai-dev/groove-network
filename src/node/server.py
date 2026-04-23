@@ -35,6 +35,7 @@ from websockets.asyncio.client import connect as ws_connect
 from src.common.protocol import (
     ACTIVATIONS,
     ASSIGN_LAYERS,
+    LOGITS,
     ASSIGNMENT_ACK,
     AUTH_CHALLENGE,
     ENVELOPE,
@@ -1360,6 +1361,32 @@ class ComputeNodeServer:
 
                 if inner.get("type") == MESH_CONNECT:
                     asyncio.create_task(self._handle_mesh_connect(ws, inner))
+                    continue
+
+                msg_type = inner.get("type")
+                if peer_id == self.downstream_peer and msg_type in (TOKEN_RESULT, LOGITS, ERROR):
+                    fwd_bytes = msgpack.packb(inner, use_bin_type=True)
+                    consumer_peers = [
+                        pid for pid in self.p2p_channels
+                        if pid != self.upstream_peer and pid != self.downstream_peer
+                    ]
+                    sent = False
+                    if consumer_peers:
+                        try:
+                            await self.p2p_channels[consumer_peers[0]].send_message(fwd_bytes)
+                            sent = True
+                        except Exception:
+                            logger.warning("mesh passthrough via P2P failed, falling back to relay")
+                    if not sent:
+                        outbound = make_envelope(
+                            inner.get("stream_id", ""), fwd_bytes,
+                            target_node_id=None,
+                        )
+                        try:
+                            await ws.send(encode_message(outbound))
+                        except (websockets.ConnectionClosed, OSError):
+                            return
+                    logger.debug("mesh passthrough %s seq=%s to consumer", msg_type, inner.get("seq_pos"))
                     continue
 
                 dispatch_start = time.perf_counter()
