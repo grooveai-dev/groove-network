@@ -39,7 +39,9 @@ from src.common.protocol import (
     AUTH_CHALLENGE,
     ENVELOPE,
     HEARTBEAT,
+    ERROR,
     ICE_CANDIDATE,
+    MESH_CONNECT,
     P2P_READY,
     PROTOCOL_VERSION,
     REBALANCE,
@@ -48,6 +50,7 @@ from src.common.protocol import (
     SDP_OFFER,
     SESSION_INIT,
     SPEC_WINDOW,
+    TOKEN_RESULT,
     decode_message,
     encode_message,
     make_activations,
@@ -58,6 +61,8 @@ from src.common.protocol import (
     make_error,
     make_heartbeat,
     make_logits,
+    make_mesh_broken,
+    make_mesh_ready,
     make_p2p_ready,
     make_register_node,
     make_sdp_answer,
@@ -511,6 +516,9 @@ class ComputeNodeServer:
             if ftype == P2P_READY:
                 await self._handle_p2p_ready(ws, frame)
                 continue
+            if ftype == MESH_CONNECT:
+                asyncio.create_task(self._handle_mesh_connect(ws, frame))
+                continue
 
             if ftype != ENVELOPE:
                 logger.warning("non-envelope frame from relay: %s", ftype)
@@ -934,6 +942,38 @@ class ComputeNodeServer:
             queue_ms=round(queue_ms, 2),
         )
         resp["node_telemetry"] = telemetry
+
+        if self.downstream_peer and self.downstream_peer in self.p2p_channels:
+            if hasattr(self, "_session_temperature"):
+                resp["temperature"] = self._session_temperature
+                resp["top_p"] = self._session_top_p
+            sampling = self._session_sampling.get(session_id)
+            if sampling:
+                resp["temperature"] = sampling["temperature"]
+                resp["top_p"] = sampling["top_p"]
+            try:
+                fwd_bytes = msgpack.packb(resp, use_bin_type=True)
+                await self.p2p_channels[self.downstream_peer].send_message(fwd_bytes)
+                logger.debug(
+                    "mesh forwarded to %s: seq=%s %d bytes",
+                    self.downstream_peer[:12], msg["seq_pos"], len(fwd_bytes),
+                )
+                return None
+            except Exception:
+                logger.warning("mesh forward failed, returning to consumer")
+                broken = make_mesh_broken(
+                    session_id=session_id,
+                    from_node_id=self.node_id,
+                    peer_node_id=self.downstream_peer,
+                    reason="forward failed",
+                )
+                if self._ws:
+                    try:
+                        await self._ws.send(encode_message(broken))
+                    except Exception:
+                        pass
+                self.downstream_peer = None
+
         return resp
 
     def _sample_from_logits(
@@ -1099,6 +1139,79 @@ class ComputeNodeServer:
 
         asyncio.create_task(self._activate_p2p(ws, from_id, msg.get("session_id", "")))
 
+    async def _handle_mesh_connect(self, ws, msg: dict) -> None:
+        """Consumer tells us about our mesh peer."""
+        downstream_id = msg.get("downstream_node_id", "")
+        upstream_id = msg.get("upstream_node_id", "")
+        session_id = msg.get("session_id", "")
+
+        if upstream_id:
+            self.upstream_peer = upstream_id
+            logger.info("MESH_CONNECT: upstream peer set to %s", upstream_id[:12])
+            return
+
+        if not downstream_id:
+            logger.warning("MESH_CONNECT missing both downstream and upstream node_id")
+            return
+
+        logger.info("MESH_CONNECT: initiating P2P to downstream %s", downstream_id[:12])
+        turn_servers = msg.get("turn_servers")
+        pm = self._get_peer_manager(turn_servers=turn_servers)
+        if pm is None:
+            return
+
+        try:
+            offer_sdp = await pm.create_offer(downstream_id)
+        except Exception:
+            logger.exception("failed to create mesh offer for %s", downstream_id[:12])
+            return
+
+        from src.common.protocol import make_sdp_offer
+        offer = make_sdp_offer(
+            session_id=session_id,
+            from_node_id=self.node_id,
+            to_node_id=downstream_id,
+            sdp=offer_sdp,
+        )
+        try:
+            await ws.send(encode_message(offer))
+        except (websockets.ConnectionClosed, OSError):
+            return
+
+        self.downstream_peer = downstream_id
+        logger.info("mesh SDP offer sent to %s via relay", downstream_id[:12])
+        asyncio.create_task(self._activate_mesh_p2p(ws, downstream_id, session_id))
+
+    async def _activate_mesh_p2p(self, ws, peer_id: str, session_id: str) -> None:
+        """Wait for mesh P2P to become ready, then notify consumer."""
+        pm = self._get_peer_manager()
+        if pm is None:
+            return
+        for _ in range(200):
+            if pm.is_connected(peer_id):
+                break
+            await asyncio.sleep(0.025)
+        else:
+            logger.warning("mesh P2P to %s timed out", peer_id[:12])
+            self.downstream_peer = None
+            return
+
+        async def _mesh_send(data: bytes):
+            await pm.send(peer_id, data)
+
+        self.p2p_channels[peer_id] = ChunkedChannel(_mesh_send)
+        logger.info("mesh P2P active: downstream=%s", peer_id[:12])
+
+        ready = make_mesh_ready(
+            session_id=session_id,
+            from_node_id=self.node_id,
+            peer_node_id=peer_id,
+        )
+        try:
+            await ws.send(encode_message(ready))
+        except (websockets.ConnectionClosed, OSError):
+            pass
+
     async def _handle_sdp_answer(self, msg: dict) -> None:
         """Apply remote SDP answer to complete handshake."""
         pm = self._get_peer_manager()
@@ -1227,6 +1340,11 @@ class ComputeNodeServer:
                     continue
 
                 deserialize_ms = (time.perf_counter() - hop_start) * 1000.0
+
+                if inner.get("type") == MESH_CONNECT:
+                    asyncio.create_task(self._handle_mesh_connect(ws, inner))
+                    continue
+
                 dispatch_start = time.perf_counter()
 
                 try:
@@ -1264,8 +1382,17 @@ class ComputeNodeServer:
                 serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
 
                 send_start = time.perf_counter()
+                reply_channel = channel
+                if peer_id == self.upstream_peer:
+                    consumer_peers = [
+                        pid for pid in self.p2p_channels
+                        if pid != self.upstream_peer and pid != self.downstream_peer
+                    ]
+                    if consumer_peers:
+                        reply_channel = self.p2p_channels[consumer_peers[0]]
+
                 try:
-                    await channel.send_message(response_bytes)
+                    await reply_channel.send_message(response_bytes)
                 except Exception:
                     logger.warning(
                         "P2P response failed for %s, falling back to relay",

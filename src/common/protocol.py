@@ -39,6 +39,9 @@ AUTH_RESPONSE = "auth_response"
 PIPELINE_MESH = "pipeline_mesh"
 KV_TRIM = "kv_trim"
 TOKEN_RESULT = "token_result"
+MESH_CONNECT = "mesh_connect"
+MESH_READY = "mesh_ready"
+MESH_BROKEN = "mesh_broken"
 
 # WebRTC P2P signaling message types.
 SDP_OFFER = "sdp_offer"
@@ -61,6 +64,7 @@ ALL_MESSAGE_TYPES = frozenset({
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
     PIPELINE_MESH, KV_TRIM, TOKEN_RESULT,
+    MESH_CONNECT, MESH_READY, MESH_BROKEN,
     SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
@@ -664,6 +668,49 @@ def make_kv_trim(
         "type": KV_TRIM,
         "session_id": session_id,
         "trim_count": int(trim_count),
+    }
+
+
+def make_mesh_connect(
+    session_id: str,
+    downstream_node_id: str = "",
+    upstream_node_id: str = "",
+) -> dict:
+    """Tell a node about its mesh peer. Upstream node gets downstream_node_id,
+    downstream node gets upstream_node_id (so it knows where to route replies)."""
+    return {
+        "type": MESH_CONNECT,
+        "session_id": session_id,
+        "downstream_node_id": downstream_node_id,
+        "upstream_node_id": upstream_node_id,
+    }
+
+
+def make_mesh_ready(
+    session_id: str,
+    from_node_id: str,
+    peer_node_id: str,
+) -> dict:
+    return {
+        "type": MESH_READY,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "peer_node_id": peer_node_id,
+    }
+
+
+def make_mesh_broken(
+    session_id: str,
+    from_node_id: str,
+    peer_node_id: str,
+    reason: str = "",
+) -> dict:
+    return {
+        "type": MESH_BROKEN,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "peer_node_id": peer_node_id,
+        "reason": reason,
     }
 
 

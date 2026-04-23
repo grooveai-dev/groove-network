@@ -40,6 +40,7 @@ from src.common.protocol import (
     ERROR,
     ICE_CANDIDATE,
     LOGITS,
+    MESH_READY,
     P2P_READY,
     PIPELINE_CONFIG,
     PROTOCOL_VERSION,
@@ -51,6 +52,7 @@ from src.common.protocol import (
     encode_message,
     make_activations,
     make_envelope,
+    make_mesh_connect,
     make_sdp_offer,
     make_session_init,
     new_session_id,
@@ -110,6 +112,7 @@ class InferenceClient:
         self.p2p_channels: dict[str, ChunkedChannel] = {}
         self.p2p_connected: set[str] = set()
         self._turn_servers: list[dict] | None = None
+        self.mesh_active: bool = False
         self._p2p_monitor_task: asyncio.Task | None = None
         self._reconnect_attempts: dict[str, int] = {}
         self._p2p_send_count: int = 0
@@ -222,6 +225,7 @@ class InferenceClient:
         self._recv_task = asyncio.create_task(self._receive_loop())
 
         await self._establish_p2p()
+        await self._establish_mesh()
 
         return self.session_id
 
@@ -289,6 +293,58 @@ class InferenceClient:
         )
 
         self._p2p_monitor_task = asyncio.create_task(self._monitor_p2p())
+
+    async def _establish_mesh(self) -> None:
+        """Set up direct node-to-node P2P for pipeline stages > 1."""
+        if len(self.pipeline) < 2:
+            return
+        if not self.p2p_connected:
+            logger.info("skipping mesh setup — no P2P connections")
+            return
+
+        for i in range(len(self.pipeline) - 1):
+            upstream = self.pipeline[i]
+            downstream = self.pipeline[i + 1]
+            upstream_id = upstream["node_id"]
+            downstream_id = downstream["node_id"]
+
+            if upstream_id not in self.p2p_connected:
+                continue
+
+            upstream_msg = make_mesh_connect(
+                session_id=self.session_id,
+                downstream_node_id=downstream_id,
+            )
+            downstream_msg = make_mesh_connect(
+                session_id=self.session_id,
+                upstream_node_id=upstream_id,
+            )
+            try:
+                up_bytes = msgpack.packb(upstream_msg, use_bin_type=True)
+                down_bytes = msgpack.packb(downstream_msg, use_bin_type=True)
+                if upstream_id in self.p2p_channels:
+                    await self.p2p_channels[upstream_id].send_message(up_bytes)
+                if downstream_id in self.p2p_channels:
+                    await self.p2p_channels[downstream_id].send_message(down_bytes)
+                logger.info(
+                    "MESH_CONNECT sent: %s -> %s",
+                    upstream_id[:12], downstream_id[:12],
+                )
+            except Exception:
+                logger.warning("failed to send MESH_CONNECT")
+                return
+
+        try:
+            await asyncio.wait_for(self._wait_for_mesh(), timeout=8.0)
+            self.mesh_active = True
+            logger.info("direct mesh active — consumer is pure orchestrator")
+        except asyncio.TimeoutError:
+            logger.warning("mesh setup timed out — falling back to consumer relay")
+
+    async def _wait_for_mesh(self) -> None:
+        """Wait until MESH_READY is received from upstream nodes."""
+        while not self.mesh_active:
+            await asyncio.sleep(0.05)
 
     async def _wait_for_p2p(self) -> None:
         """Wait until all pipeline nodes are P2P-connected."""
@@ -385,6 +441,14 @@ class InferenceClient:
                     continue
                 if mtype == P2P_READY:
                     await self._handle_p2p_ready(msg)
+                    continue
+                if mtype == MESH_READY:
+                    logger.info(
+                        "MESH_READY: %s -> %s",
+                        msg.get("from_node_id", "?")[:12],
+                        msg.get("peer_node_id", "?")[:12],
+                    )
+                    self.mesh_active = True
                     continue
 
                 if msg["type"] == ENVELOPE:
@@ -675,6 +739,12 @@ class InferenceClient:
         """
         for attempt in range(1, self.max_retries + 1):
             try:
+                if self.mesh_active and len(self.pipeline) > 1:
+                    response = await self._send_to_node(
+                        self.pipeline[0]["node_id"], message,
+                    )
+                    return response
+
                 msg = message
                 last_response: dict = {}
                 for node in self.pipeline:
@@ -714,6 +784,11 @@ class InferenceClient:
 
     async def _send_through_stages(self, message: dict) -> dict:
         """Send a single message through all pipeline stages serially."""
+        if self.mesh_active and len(self.pipeline) > 1:
+            return await self._send_to_node(
+                self.pipeline[0]["node_id"], message, stage_idx=0,
+            )
+
         msg = message
         for idx, node in enumerate(self.pipeline):
             response = await self._send_to_node(node["node_id"], msg, stage_idx=idx)

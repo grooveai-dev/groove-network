@@ -43,6 +43,8 @@ from src.common.protocol import (
     HEARTBEAT,
     ICE_CANDIDATE,
     KV_TRIM,
+    MESH_BROKEN,
+    MESH_READY,
     P2P_READY,
     PIPELINE_CONFIG,
     PIPELINE_MESH,
@@ -574,7 +576,8 @@ class RelayNode:
                     ce = self.streams.get(sid) if sid else None
                     if ce is not None:
                         await self._safe_send(ce.ws, encode_message(msg))
-                elif t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY):
+                elif t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
+                          MESH_READY, MESH_BROKEN):
                     await self._forward_signaling(node_id, msg)
                 elif t == DEREGISTER:
                     logger.info(
