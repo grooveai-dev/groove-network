@@ -1204,6 +1204,14 @@ class ComputeNodeServer:
             await pm.send(peer_id, data)
 
         self.p2p_channels[peer_id] = ChunkedChannel(_mesh_send)
+
+        old_task = self._p2p_recv_tasks.pop(peer_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._p2p_recv_tasks[peer_id] = asyncio.create_task(
+            self._p2p_receive_loop(ws, peer_id)
+        )
+
         logger.info("mesh P2P active: downstream=%s", peer_id[:12])
 
         ready = make_mesh_ready(

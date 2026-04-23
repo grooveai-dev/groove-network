@@ -13,6 +13,7 @@ Wire format per chunk (12 bytes header + payload):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 48 * 1024
 MAX_CHUNKS_PER_MESSAGE = 65535
 MAX_PENDING_MESSAGES = 64
-REASSEMBLY_TTL_SECONDS = 5.0
+REASSEMBLY_TTL_SECONDS = 15.0
 
 HEADER_FMT = "!IIHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12 bytes
@@ -62,6 +63,8 @@ class ChunkedChannel:
             flags = 1 if idx == total - 1 else 0
             header = struct.pack(HEADER_FMT, msg_id, idx, total, flags)
             await self._send_func(header + bytes(chunk))
+            if idx < total - 1:
+                await asyncio.sleep(0)
 
     def on_chunk_received(self, raw: bytes) -> bytes | None:
         """Process incoming chunk. Returns reassembled message when complete."""
