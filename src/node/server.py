@@ -216,7 +216,7 @@ class ComputeNodeServer:
         self.model_preferences = model_preferences or ([model_name] if model_name else [])
 
         self.shard: dict | None = None
-        self.kv_manager = KVCacheManager()
+        self.kv_manager: KVCacheManager | None = None
         self.bench_data: dict | None = None
 
         if node_id is not None:
@@ -306,7 +306,14 @@ class ComputeNodeServer:
                 quantize=self.quantize,
             ),
         )
+        self._init_kv_manager()
         logger.info("shard loaded node_id=%s", self.node_id)
+
+    def _init_kv_manager(self) -> None:
+        quantize_kv = self.device == "mps"
+        config = self.shard["config"] if self.shard else None
+        self.kv_manager = KVCacheManager(config=config, quantize=quantize_kv)
+        logger.info("KV cache: %s", "INT4-quantized" if quantize_kv else "FP16")
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -447,7 +454,7 @@ class ComputeNodeServer:
         while True:
             await asyncio.sleep(10)
             cleanup_counter += 1
-            if cleanup_counter % 6 == 0:
+            if cleanup_counter % 6 == 0 and self.kv_manager is not None:
                 expired = self.kv_manager.cleanup_expired(ttl_seconds=300.0)
                 if expired:
                     logger.info("cleaned up %d expired KV sessions", len(expired))
@@ -538,6 +545,7 @@ class ComputeNodeServer:
                     self.shard = await self._load_shard_async(
                         self.model_name, self.layer_start, self.layer_end,
                     )
+                    self._init_kv_manager()
                     logger.info("shard reloaded after OOM recovery")
                 except Exception:
                     logger.exception("shard reload failed after OOM")
@@ -692,6 +700,7 @@ class ComputeNodeServer:
             self.model_name = model_name
             self.layer_start = layer_start
             self.layer_end = layer_end
+            self._init_kv_manager()
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             logger.info("shard loaded in %.0fms", elapsed_ms)
             await self._send_ack(
@@ -744,6 +753,7 @@ class ComputeNodeServer:
             self.model_name = model_name
             self.layer_start = layer_start
             self.layer_end = layer_end
+            self._init_kv_manager()
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             await self._send_ack(
                 ws,
@@ -1229,6 +1239,7 @@ class ComputeNodeServer:
                         self.shard = await self._load_shard_async(
                             self.model_name, self.layer_start, self.layer_end,
                         )
+                        self._init_kv_manager()
                     except Exception:
                         logger.exception("shard reload failed after OOM")
                     response = make_error(

@@ -3,23 +3,58 @@
 Each compute node maintains KV caches for its assigned layer range,
 keyed by session_id. Wraps transformers DynamicCache with session
 management (TTL cleanup, context limits).
+
+Supports INT4-quantized cache via optimum-quanto to reduce memory
+footprint by ~75% on RAM-constrained devices (e.g. Apple Silicon).
 """
 
 import logging
+import os
+import sys
 import time
 
 from transformers import DynamicCache
 
 logger = logging.getLogger(__name__)
 
+_QUANTIZED_AVAILABLE = False
+_QuantizedCache = None
+
+try:
+    venv_bin = os.path.join(sys.prefix, "bin")
+    if venv_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+
+    from transformers.cache_utils import QuantizedCache as _QuantizedCache
+    import optimum.quanto  # noqa: F401 — required backend
+    _QUANTIZED_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _make_cache(config=None, quantize: bool = False):
+    if quantize and _QUANTIZED_AVAILABLE and config is not None:
+        try:
+            cache = _QuantizedCache("quanto", config, nbits=4, residual_length=128)
+            logger.info("using INT4 quantized KV cache (quanto backend)")
+            return cache
+        except Exception as e:
+            logger.warning("INT4 KV cache init failed (%s), falling back to FP16", e)
+    elif quantize and not _QUANTIZED_AVAILABLE:
+        logger.warning("quantized KV cache requested but optimum-quanto not installed, falling back to FP16")
+    return DynamicCache()
+
 
 class SessionKVCache:
     """Manages the KV cache for a single session using DynamicCache."""
 
-    def __init__(self, num_layers: int, max_context: int = 4096):
+    def __init__(self, num_layers: int, max_context: int = 4096,
+                 config=None, quantize: bool = False):
         self.num_layers = num_layers
         self.max_context = max_context
-        self.cache = DynamicCache()
+        self._config = config
+        self._quantize = quantize
+        self.cache = _make_cache(config, quantize)
         self.last_access = time.time()
 
     @property
@@ -31,15 +66,17 @@ class SessionKVCache:
         return self.cache
 
     def clear(self) -> None:
-        self.cache = DynamicCache()
+        self.cache = _make_cache(self._config, self._quantize)
 
 
 class KVCacheManager:
     """Manages multiple SessionKVCache instances keyed by session_id."""
 
-    def __init__(self, max_sessions: int = 100):
+    def __init__(self, max_sessions: int = 100, config=None, quantize: bool = False):
         self._sessions: dict[str, SessionKVCache] = {}
         self._max_sessions = max_sessions
+        self._config = config
+        self._quantize = quantize
 
     def create_session(
         self,
@@ -54,7 +91,10 @@ class KVCacheManager:
                 self._sessions, key=lambda s: self._sessions[s].last_access,
             )
             self.remove_session(oldest_sid)
-        cache = SessionKVCache(num_layers=num_layers, max_context=max_context)
+        cache = SessionKVCache(
+            num_layers=num_layers, max_context=max_context,
+            config=self._config, quantize=self._quantize,
+        )
         self._sessions[session_id] = cache
         return cache
 
