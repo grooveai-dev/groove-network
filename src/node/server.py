@@ -243,6 +243,7 @@ class ComputeNodeServer:
         self.upstream_peer: str | None = None
         self.downstream_peer: str | None = None
         self.p2p_channels: dict[str, ChunkedChannel] = {}
+        self._p2p_recv_tasks: dict[str, asyncio.Task] = {}
         self._session_sampling: dict[str, dict] = {}
 
         self._gpu_model_cached: str = ""
@@ -1112,6 +1113,9 @@ class ComputeNodeServer:
 
         if pm.is_connected(from_id) or from_id in self.p2p_channels:
             logger.info("re-offer from %s, replacing old connection", from_id[:12])
+            old_task = self._p2p_recv_tasks.pop(from_id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
             self.p2p_channels.pop(from_id, None)
             try:
                 await pm.close(from_id)
@@ -1291,7 +1295,12 @@ class ComputeNodeServer:
 
         self.p2p_channels[peer_id] = ChunkedChannel(_p2p_send)
 
-        asyncio.create_task(self._p2p_receive_loop(ws, peer_id))
+        old_task = self._p2p_recv_tasks.pop(peer_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._p2p_recv_tasks[peer_id] = asyncio.create_task(
+            self._p2p_receive_loop(ws, peer_id)
+        )
 
         ready_msg = make_p2p_ready(
             session_id=session_id,
