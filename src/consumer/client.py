@@ -40,6 +40,7 @@ from src.common.protocol import (
     ERROR,
     ICE_CANDIDATE,
     LOGITS,
+    MESH_BROKEN,
     MESH_READY,
     P2P_READY,
     PIPELINE_CONFIG,
@@ -462,6 +463,18 @@ class InferenceClient:
                     )
                     self.mesh_active = True
                     self._mesh_ready_event.set()
+                    continue
+                if mtype == MESH_BROKEN:
+                    logger.warning(
+                        "MESH_BROKEN: %s — %s",
+                        msg.get("from_node_id", "?")[:12],
+                        msg.get("reason", "unknown"),
+                    )
+                    self.mesh_active = False
+                    for fut in self._mesh_result_waiters.values():
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("mesh broken"))
+                    self._mesh_result_waiters.clear()
                     continue
 
                 if msg["type"] == ENVELOPE:
