@@ -180,12 +180,10 @@ def _deserialize_payload(data: bytes, device: str = "cpu") -> torch.Tensor:
         arr = np.frombuffer(raw_data, dtype=np.float16).reshape(shape)
         tensor = torch.from_numpy(arr.copy()).to(torch.bfloat16)
     else:
-        np_dtype = np.dtype(dtype_str)
-        arr = np.frombuffer(raw_data, dtype=np_dtype).reshape(shape)
         torch_dtype = _NP_TO_TORCH[dtype_str]
-        tensor = torch.from_numpy(arr.copy()).to(torch_dtype)
+        tensor = torch.frombuffer(bytearray(raw_data), dtype=torch_dtype).reshape(shape)
 
     if device != "cpu":
-        tensor = tensor.to(device)
+        tensor = tensor.to(device, non_blocking=True)
 
     return tensor

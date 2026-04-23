@@ -48,6 +48,11 @@ class ChunkedChannel:
             await self._send_func(header)
             return
 
+        if len(data) <= self.chunk_size:
+            header = struct.pack(HEADER_FMT, msg_id, 0, 1, 1)
+            await self._send_func(header + data)
+            return
+
         total = -(-len(data) // self.chunk_size)  # ceil division
 
         if total > MAX_CHUNKS_PER_MESSAGE:

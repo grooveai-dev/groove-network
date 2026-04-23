@@ -60,6 +60,7 @@ class _PeerState:
     control_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     tensor_connected: bool = False
     control_connected: bool = False
+    connected_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class PeerConnectionManager:
@@ -85,6 +86,8 @@ class PeerConnectionManager:
                 state.tensor_connected = True
             else:
                 state.control_connected = True
+            if state.tensor_connected and state.control_connected:
+                state.connected_event.set()
             logger.info("%s channel open", kind, extra={"peer": remote_node_id})
 
         @channel.on("close")
@@ -93,6 +96,7 @@ class PeerConnectionManager:
                 state.tensor_connected = False
             else:
                 state.control_connected = False
+            state.connected_event.clear()
             logger.info("%s channel closed", kind, extra={"peer": remote_node_id})
 
         @channel.on("message")
@@ -104,6 +108,8 @@ class PeerConnectionManager:
                 state.tensor_connected = True
             else:
                 state.control_connected = True
+            if state.tensor_connected and state.control_connected:
+                state.connected_event.set()
 
     async def create_offer(self, remote_node_id: str) -> str:
         """Create RTCPeerConnection + dual data channels, return SDP offer."""
@@ -114,7 +120,7 @@ class PeerConnectionManager:
         tensor_ch = pc.createDataChannel(
             f"groove-tensor-{self._session_id}",
             ordered=True,
-            maxRetransmits=None,
+            maxRetransmits=5,
         )
         state.tensor_channel = tensor_ch
         self._setup_channel_events(remote_node_id, tensor_ch, "tensor")
@@ -224,6 +230,19 @@ class PeerConnectionManager:
         if state is None:
             return False
         return state.tensor_connected and state.control_connected
+
+    async def wait_connected(self, remote_node_id: str, timeout: float = 10.0) -> bool:
+        """Wait until both data channels are open, or timeout."""
+        state = self._peers.get(remote_node_id)
+        if state is None:
+            return False
+        if state.tensor_connected and state.control_connected:
+            return True
+        try:
+            await asyncio.wait_for(state.connected_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def close(self, remote_node_id: str) -> None:
         """Close a specific peer connection and clean up."""

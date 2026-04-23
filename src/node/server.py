@@ -82,6 +82,19 @@ logger = logging.getLogger("node")
 _NODE_START_TIME = time.time()
 
 
+def _peek_msg_type(data: bytes) -> str | None:
+    """Extract the 'type' field from msgpack bytes without full deserialization."""
+    try:
+        unpacker = msgpack.Unpacker(raw=False, max_buffer_size=256)
+        unpacker.feed(data[:256])
+        obj = unpacker.unpack()
+        if isinstance(obj, dict):
+            return obj.get("type")
+    except Exception:
+        pass
+    return None
+
+
 def _capabilities(
     model_name: str | None,
     device: str,
@@ -963,7 +976,7 @@ class ComputeNodeServer:
                     "mesh forwarded to %s: seq=%s %d bytes",
                     self.downstream_peer[:12], msg["seq_pos"], len(fwd_bytes),
                 )
-                return None
+                return resp
             except Exception:
                 logger.warning("mesh forward failed, returning to consumer")
                 broken = make_mesh_broken(
@@ -1195,11 +1208,7 @@ class ComputeNodeServer:
         pm = self._get_peer_manager()
         if pm is None:
             return
-        for _ in range(200):
-            if pm.is_connected(peer_id):
-                break
-            await asyncio.sleep(0.025)
-        else:
+        if not await pm.wait_connected(peer_id, timeout=5.0):
             logger.warning("mesh P2P to %s timed out", peer_id[:12])
             self.downstream_peer = None
             return
@@ -1294,11 +1303,7 @@ class ComputeNodeServer:
         pm = self.peer_manager
         if pm is None:
             return
-        for _ in range(200):
-            if pm.is_connected(peer_id):
-                break
-            await asyncio.sleep(0.05)
-        else:
+        if not await pm.wait_connected(peer_id, timeout=10.0):
             logger.warning("P2P activation timeout for %s", peer_id[:12])
             return
 
@@ -1348,6 +1353,40 @@ class ComputeNodeServer:
 
                 hop_start = time.perf_counter()
 
+                if peer_id == self.downstream_peer:
+                    peeked_type = _peek_msg_type(complete)
+                    if peeked_type in (TOKEN_RESULT, LOGITS, ERROR):
+                        consumer_peers = [
+                            pid for pid in self.p2p_channels
+                            if pid != self.upstream_peer and pid != self.downstream_peer
+                        ]
+                        sent = False
+                        if consumer_peers:
+                            try:
+                                await self.p2p_channels[consumer_peers[0]].send_message(complete)
+                                sent = True
+                            except Exception:
+                                logger.warning("mesh passthrough via P2P failed, falling back to relay")
+                        if not sent:
+                            inner = msgpack.unpackb(
+                                complete, raw=False,
+                                max_str_len=10 * 1024 * 1024,
+                                max_bin_len=10 * 1024 * 1024,
+                                max_array_len=10_000,
+                                max_map_len=1_000,
+                            )
+                            fwd_bytes = msgpack.packb(inner, use_bin_type=True)
+                            outbound = make_envelope(
+                                inner.get("stream_id", ""), fwd_bytes,
+                                target_node_id=None,
+                            )
+                            try:
+                                await ws.send(encode_message(outbound))
+                            except (websockets.ConnectionClosed, OSError):
+                                return
+                        logger.debug("mesh passthrough %s to consumer (zero-copy)", peeked_type)
+                        continue
+
                 try:
                     inner = msgpack.unpackb(
                         complete, raw=False,
@@ -1364,32 +1403,6 @@ class ComputeNodeServer:
 
                 if inner.get("type") == MESH_CONNECT:
                     asyncio.create_task(self._handle_mesh_connect(ws, inner))
-                    continue
-
-                msg_type = inner.get("type")
-                if peer_id == self.downstream_peer and msg_type in (TOKEN_RESULT, LOGITS, ERROR):
-                    fwd_bytes = msgpack.packb(inner, use_bin_type=True)
-                    consumer_peers = [
-                        pid for pid in self.p2p_channels
-                        if pid != self.upstream_peer and pid != self.downstream_peer
-                    ]
-                    sent = False
-                    if consumer_peers:
-                        try:
-                            await self.p2p_channels[consumer_peers[0]].send_message(fwd_bytes)
-                            sent = True
-                        except Exception:
-                            logger.warning("mesh passthrough via P2P failed, falling back to relay")
-                    if not sent:
-                        outbound = make_envelope(
-                            inner.get("stream_id", ""), fwd_bytes,
-                            target_node_id=None,
-                        )
-                        try:
-                            await ws.send(encode_message(outbound))
-                        except (websockets.ConnectionClosed, OSError):
-                            return
-                    logger.debug("mesh passthrough %s seq=%s to consumer", msg_type, inner.get("seq_pos"))
                     continue
 
                 dispatch_start = time.perf_counter()

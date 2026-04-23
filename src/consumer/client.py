@@ -113,6 +113,8 @@ class InferenceClient:
         self.p2p_connected: set[str] = set()
         self._turn_servers: list[dict] | None = None
         self.mesh_active: bool = False
+        self._p2p_ready_event = asyncio.Event()
+        self._mesh_ready_event = asyncio.Event()
         self._p2p_monitor_task: asyncio.Task | None = None
         self._reconnect_attempts: dict[str, int] = {}
         self._p2p_send_count: int = 0
@@ -123,6 +125,7 @@ class InferenceClient:
         self._last_token_timing: dict = {}
         self._live_trace_path: str = ""
         self._live_trace_file = None
+        self._mesh_result_waiters: dict[int, asyncio.Future] = {}
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -153,11 +156,14 @@ class InferenceClient:
 
         self.model_name = model_name
         self.session_id = new_session_id()
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=False,
-        )
         self._session_temperature = temperature
         self._session_top_p = top_p
+
+        tokenizer_task = asyncio.create_task(
+            asyncio.to_thread(
+                AutoTokenizer.from_pretrained, model_name, trust_remote_code=False,
+            )
+        )
 
         session_config = dict(config or {})
         session_config["node_side_sampling"] = True
@@ -175,6 +181,7 @@ class InferenceClient:
         if response["type"] == ERROR:
             msg = response.get("message", "")
             code = response.get("code")
+            tokenizer_task.cancel()
             if code in ("COVERAGE_INCOMPLETE", "NO_NODES") or "coverage" in msg.lower():
                 raise RuntimeError(
                     "Network does not have full model coverage yet. "
@@ -182,6 +189,7 @@ class InferenceClient:
                 )
             raise RuntimeError(f"Session init failed: {msg}")
         if response["type"] != PIPELINE_CONFIG:
+            tokenizer_task.cancel()
             raise RuntimeError(f"Unexpected response type: {response['type']}")
 
         self.pipeline = response["nodes"]
@@ -226,6 +234,8 @@ class InferenceClient:
 
         await self._establish_p2p()
         await self._establish_mesh()
+
+        self.tokenizer = await tokenizer_task
 
         return self.session_id
 
@@ -343,14 +353,16 @@ class InferenceClient:
 
     async def _wait_for_mesh(self) -> None:
         """Wait until MESH_READY is received from upstream nodes."""
-        while not self.mesh_active:
-            await asyncio.sleep(0.05)
+        if self.mesh_active:
+            return
+        await self._mesh_ready_event.wait()
 
     async def _wait_for_p2p(self) -> None:
         """Wait until all pipeline nodes are P2P-connected."""
         expected = {n["node_id"] for n in self.pipeline}
-        while not expected.issubset(self.p2p_connected):
-            await asyncio.sleep(0.05)
+        if expected.issubset(self.p2p_connected):
+            return
+        await self._p2p_ready_event.wait()
 
     async def _monitor_p2p(self) -> None:
         """Background task: detect dropped P2P peers and attempt reconnection."""
@@ -449,6 +461,7 @@ class InferenceClient:
                         msg.get("peer_node_id", "?")[:12],
                     )
                     self.mesh_active = True
+                    self._mesh_ready_event.set()
                     continue
 
                 if msg["type"] == ENVELOPE:
@@ -463,13 +476,18 @@ class InferenceClient:
                     except Exception:
                         logger.warning("failed to decode envelope payload, skipping")
                         continue
-                    if inner.get("type") == ERROR:
-                        seq = inner.get("seq_pos")
+                    inner_type = inner.get("type")
+                    seq = inner.get("seq_pos")
+                    if inner_type == ERROR:
                         err = RuntimeError(
                             f"Node error [{inner.get('code')}]: "
                             f"{inner.get('message', '')}"
                         )
                         if seq is not None:
+                            mesh_fut = self._mesh_result_waiters.pop(seq, None)
+                            if mesh_fut and not mesh_fut.done():
+                                mesh_fut.set_exception(err)
+                                continue
                             fut = self._waiters.pop(seq, None)
                             if fut is not None and not fut.done():
                                 fut.set_exception(err)
@@ -479,10 +497,15 @@ class InferenceClient:
                                     fut.set_exception(err)
                             self._waiters.clear()
                         continue
-                    seq = inner.get("seq_pos")
-                    fut = self._waiters.pop(seq, None)
-                    if fut is not None and not fut.done():
-                        fut.set_result(inner)
+                    if seq is not None and inner_type in (TOKEN_RESULT, LOGITS):
+                        mesh_fut = self._mesh_result_waiters.pop(seq, None)
+                        if mesh_fut and not mesh_fut.done():
+                            mesh_fut.set_result(inner)
+                            continue
+                    if seq is not None:
+                        fut = self._waiters.pop(seq, None)
+                        if fut is not None and not fut.done():
+                            fut.set_result(inner)
                 elif msg["type"] == ERROR:
                     code = msg.get("code", "")
                     if code == "NODE_GONE":
@@ -539,6 +562,8 @@ class InferenceClient:
             self.p2p_channels[node_id] = ChunkedChannel(_p2p_send)
 
         self.p2p_connected.add(node_id)
+        if {n["node_id"] for n in self.pipeline}.issubset(self.p2p_connected):
+            self._p2p_ready_event.set()
         logger.info("P2P channel ready with %s", node_id[:12])
         asyncio.create_task(self._p2p_receive_loop(node_id))
 
@@ -573,19 +598,30 @@ class InferenceClient:
                     logger.warning("P2P payload decode failed from %s", node_id[:12])
                     continue
 
-                if inner.get("type") == ERROR:
-                    seq = inner.get("seq_pos")
+                msg_type = inner.get("type")
+                seq = inner.get("seq_pos")
+
+                if msg_type == ERROR:
                     err = RuntimeError(
                         f"Node error [{inner.get('code')}]: "
                         f"{inner.get('message', '')}"
                     )
                     if seq is not None:
+                        mesh_fut = self._mesh_result_waiters.pop(seq, None)
+                        if mesh_fut and not mesh_fut.done():
+                            mesh_fut.set_exception(err)
+                            continue
                         fut = self._waiters.pop(seq, None)
                         if fut is not None and not fut.done():
                             fut.set_exception(err)
                     continue
 
-                seq = inner.get("seq_pos")
+                if seq is not None and msg_type in (TOKEN_RESULT, LOGITS):
+                    mesh_fut = self._mesh_result_waiters.pop(seq, None)
+                    if mesh_fut and not mesh_fut.done():
+                        mesh_fut.set_result(inner)
+                        continue
+
                 if seq is not None:
                     fut = self._waiters.pop(seq, None)
                     if fut is not None and not fut.done():
@@ -740,10 +776,19 @@ class InferenceClient:
         for attempt in range(1, self.max_retries + 1):
             try:
                 if self.mesh_active and len(self.pipeline) > 1:
-                    response = await self._send_to_node(
+                    seq = message["seq_pos"]
+                    mesh_fut: asyncio.Future = asyncio.get_event_loop().create_future()
+                    self._mesh_result_waiters[seq] = mesh_fut
+                    await self._send_to_node(
                         self.pipeline[0]["node_id"], message,
                     )
-                    return response
+                    try:
+                        return await asyncio.wait_for(mesh_fut, timeout=self.node_timeout)
+                    except asyncio.TimeoutError:
+                        self._mesh_result_waiters.pop(seq, None)
+                        raise RuntimeError(
+                            f"Mesh result timeout for seq_pos={seq}"
+                        )
 
                 msg = message
                 last_response: dict = {}
@@ -785,9 +830,20 @@ class InferenceClient:
     async def _send_through_stages(self, message: dict) -> dict:
         """Send a single message through all pipeline stages serially."""
         if self.mesh_active and len(self.pipeline) > 1:
-            return await self._send_to_node(
+            seq = message["seq_pos"]
+            loop = asyncio.get_event_loop()
+            mesh_fut: asyncio.Future = loop.create_future()
+            self._mesh_result_waiters[seq] = mesh_fut
+            await self._send_to_node(
                 self.pipeline[0]["node_id"], message, stage_idx=0,
             )
+            try:
+                return await asyncio.wait_for(mesh_fut, timeout=self.node_timeout)
+            except asyncio.TimeoutError:
+                self._mesh_result_waiters.pop(seq, None)
+                raise RuntimeError(
+                    f"Mesh result timeout for seq_pos={seq}"
+                )
 
         msg = message
         for idx, node in enumerate(self.pipeline):
@@ -1260,14 +1316,14 @@ class InferenceClient:
         temperature: float,
         top_p: float,
     ) -> AsyncGenerator[str, None]:
-        """Token generation for multi-node pipelines using stage queues.
+        """Token generation for multi-node pipelines.
 
-        Uses the stage-queue architecture: each pipeline stage has its own
-        asyncio queue. Stage workers process items concurrently, so when
-        multiple tokens are in flight (e.g. via speculative candidates fed
-        into the pipeline), stages overlap. For pure autoregressive mode,
-        tokens are sequential but still benefit from the direct stage-to-stage
-        handoff without returning to the consumer between stages.
+        When mesh is active: sends only to Stage 0 (which forwards to
+        downstream via mesh). Stage 0 returns ACTIVATIONS immediately;
+        TOKEN_RESULT arrives asynchronously via mesh passthrough.
+
+        When mesh is not active: uses stage-queue architecture for
+        serial stage-to-stage forwarding.
         """
         eos_id = self.tokenizer.eos_token_id
         stop_ids = {eos_id}
@@ -1275,6 +1331,15 @@ class InferenceClient:
         if isinstance(im_end_id, int) and im_end_id != self.tokenizer.unk_token_id:
             stop_ids.add(im_end_id)
         next_token = first_token
+
+        if self.mesh_active and len(self.pipeline) > 1:
+            async for text in self._mesh_pipelined_generate(
+                generated, next_token, remaining_tokens, stop_ids,
+                temperature, top_p,
+            ):
+                yield text
+            return
+
         num_stages = len(self.pipeline)
 
         _SENTINEL = object()
@@ -1387,6 +1452,95 @@ class InferenceClient:
                 except (asyncio.CancelledError, Exception):
                     pass
 
+    async def _mesh_pipelined_generate(
+        self,
+        generated: list[int],
+        next_token: int,
+        remaining_tokens: int,
+        stop_ids: set[int],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> AsyncGenerator[str, None]:
+        """Pipelined generation when mesh is active.
+
+        Sends to Stage 0 only. Stage 0 returns ACTIVATIONS immediately
+        (non-blocking), then forwards to downstream via mesh. TOKEN_RESULT
+        arrives asynchronously via the mesh passthrough path.
+        """
+        stage0_id = self.pipeline[0]["node_id"]
+        loop = asyncio.get_event_loop()
+
+        for _ in range(remaining_tokens):
+            if next_token in stop_ids:
+                break
+
+            trace_idx = len(self._token_traces)
+            token_start = time.perf_counter()
+            seq = len(generated) - 1
+
+            token_tensor = torch.tensor([next_token], dtype=torch.int64)
+            msg = make_activations(
+                self.session_id,
+                seq_pos=seq,
+                hidden_states_bytes=serialize_tensor(token_tensor),
+                shape=tuple(token_tensor.shape),
+                dtype="int64",
+            )
+            msg["is_prompt"] = False
+
+            mesh_fut: asyncio.Future = loop.create_future()
+            self._mesh_result_waiters[seq] = mesh_fut
+
+            await self._send_to_node(stage0_id, msg, stage_idx=0)
+
+            try:
+                response = await asyncio.wait_for(mesh_fut, timeout=self.node_timeout)
+            except asyncio.TimeoutError:
+                self._mesh_result_waiters.pop(seq, None)
+                raise RuntimeError(f"Mesh result timeout for seq_pos={seq}")
+
+            pipeline_ms = (time.perf_counter() - token_start) * 1000.0
+
+            if response.get("type") == ERROR:
+                raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
+
+            sample_ms = 0.0
+            logits_deser_ms = 0.0
+            if response.get("type") == TOKEN_RESULT:
+                next_token = response["token_id"]
+                sample_ms = response.get("sample_ms", 0.0)
+            else:
+                logits_start = time.perf_counter()
+                logits = _logits_from_response(response)
+                logits_deser_ms = (time.perf_counter() - logits_start) * 1000.0
+                sample_start = time.perf_counter()
+                next_token = self._sample_token(
+                    _last_token_logits(logits), temperature, top_p,
+                )
+                sample_ms = (time.perf_counter() - sample_start) * 1000.0
+
+            generated.append(next_token)
+
+            if next_token in stop_ids:
+                break
+
+            decode_start = time.perf_counter()
+            text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+            decode_ms = (time.perf_counter() - decode_start) * 1000.0
+
+            token_ms = (time.perf_counter() - token_start) * 1000.0
+            self._last_token_timing = {
+                "token_ms": round(token_ms, 2),
+                "pipeline_ms": round(pipeline_ms, 2),
+                "logits_deser_ms": round(logits_deser_ms, 2),
+                "sample_ms": round(sample_ms, 2),
+                "decode_ms": round(decode_ms, 2),
+                "is_prefill": False,
+                "node_sampled": response.get("type") == TOKEN_RESULT,
+                "stages": self._token_traces[trace_idx:],
+            }
+            yield text
+
     def _sample_token(
         self, logits: np.ndarray, temperature: float, top_p: float
     ) -> int:
@@ -1450,6 +1604,10 @@ class InferenceClient:
             self.peer_manager = None
         self.p2p_channels.clear()
         self.p2p_connected.clear()
+        for fut in self._mesh_result_waiters.values():
+            if not fut.done():
+                fut.cancel()
+        self._mesh_result_waiters.clear()
         self.session_id = None
         self.stream_id = None
         self.pipeline = []

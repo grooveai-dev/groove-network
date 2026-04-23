@@ -322,9 +322,15 @@ def forward_shard(
         output = layer(**layer_kwargs)
         hidden_states = output[0] if isinstance(output, tuple) else output
 
+    _mps_sync = hasattr(torch, 'mps') and str(hidden_states.device).startswith('mps')
+
     if is_last_shard:
         hidden_states = shard["norm"](hidden_states)
         logits = shard["lm_head"](hidden_states)
+        if _mps_sync:
+            torch.mps.synchronize()
         return logits, kv_cache
 
+    if _mps_sync:
+        torch.mps.synchronize()
     return hidden_states, kv_cache
