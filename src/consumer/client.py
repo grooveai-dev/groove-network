@@ -903,7 +903,8 @@ class InferenceClient:
             raise RuntimeError("No active session. Call start_session() first.")
 
         if use_speculative is None:
-            use_speculative = len(self.pipeline) == 1
+            node_samples = getattr(self, "_session_temperature", None) is not None
+            use_speculative = len(self.pipeline) == 1 and not node_samples
 
         if raw_mode:
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
