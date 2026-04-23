@@ -1286,6 +1286,7 @@ class InferenceClient:
             node = self.pipeline[idx]
             in_q = stage_queues[idx]
             out_q = stage_queues[idx + 1]
+            final_q = stage_queues[num_stages]
             try:
                 while True:
                     item = await in_q.get()
@@ -1297,10 +1298,8 @@ class InferenceClient:
                         node["node_id"], msg, stage_idx=idx,
                     )
                     t = response.get("type")
-                    if t in (LOGITS, TOKEN_RESULT, VERIFY_RESULT, ERROR):
-                        await out_q.put((response, seq_idx))
-                    elif t == ACTIVATIONS:
-                        await out_q.put((response, seq_idx))
+                    if t in (LOGITS, TOKEN_RESULT, VERIFY_RESULT, ERROR) and idx < num_stages - 1:
+                        await final_q.put((response, seq_idx))
                     else:
                         await out_q.put((response, seq_idx))
             except Exception as exc:
