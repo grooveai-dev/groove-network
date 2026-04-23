@@ -184,6 +184,6 @@ def _deserialize_payload(data: bytes, device: str = "cpu") -> torch.Tensor:
         tensor = torch.frombuffer(bytearray(raw_data), dtype=torch_dtype).reshape(shape)
 
     if device != "cpu":
-        tensor = tensor.to(device, non_blocking=True)
+        tensor = tensor.to(device)
 
     return tensor
